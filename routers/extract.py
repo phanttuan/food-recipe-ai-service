@@ -1,11 +1,12 @@
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, Any, Dict, List
 from services.llm_service import extract_recipe, batch_extract_recipes
 
 router = APIRouter(prefix="/extract", tags=["Extract"])
 
 class ExtractRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     text: Optional[str] = ""
     audioUrl: Optional[str] = ""
     schema: Optional[Dict[str, Any]] = None

@@ -99,8 +99,23 @@ def _appears_in_source(item: str, source_norm: str) -> bool:
     return hits >= max(1, len(words) - 1)
 
 
+def _instruction_grounding_ratio(instruction: str, source_norm: str) -> float:
+    """Return the fraction of content words in *instruction* that appear in *source_norm*.
+
+    Short common Vietnamese words (≤2 chars) are skipped since they are
+    function words (cho, và, với, rồi …) that don't indicate hallucination.
+    """
+    words = [w for w in _normalize(instruction).split() if len(w) > 2]
+    if not words:
+        return 1.0
+    hits = sum(1 for w in words if w in source_norm)
+    return hits / len(words)
+
+
 def verify_step_grounding(step: dict, source_text: str) -> dict:
-    """Drop main/with items the model invented but the source never mentions."""
+    """Drop main/with items the model invented but the source never mentions.
+    Also remove instruction if it is mostly ungrounded so render_step will
+    compose a safe template-based fallback from structured fields."""
     if not isinstance(step, dict):
         return step
     source_norm = _normalize(source_text)
@@ -112,6 +127,18 @@ def verify_step_grounding(step: dict, source_text: str) -> dict:
             if dropped:
                 logger.info(f"Dropped ungrounded {key} items: {dropped}")
             step[key] = kept
+
+    # Check instruction grounding — drop if <40% of content words are in source
+    instruction = step.get("instruction") or ""
+    if instruction:
+        ratio = _instruction_grounding_ratio(instruction, source_norm)
+        if ratio < 0.4:
+            logger.warning(
+                f"Dropped hallucinated instruction (grounding {ratio:.0%}): "
+                f"{instruction[:80]}..."
+            )
+            del step["instruction"]
+
     return step
 
 
@@ -159,56 +186,52 @@ def _join_parts(parts: list[str]) -> str:
 
 
 def render_step(step: dict, index: int) -> dict:
-    """Render compact structured step data into the legacy instruction field."""
+    """Render step into instruction field, prioritizing LLM's detailed instruction.
+    Never auto-concatenate ingredient lists into fake generic template sentences."""
     if isinstance(step, str):
         return {"stepNumber": index, "instruction": step.strip()}
 
     if not isinstance(step, dict):
         return {"stepNumber": index, "instruction": f"Bước {index}."}
 
-    if step.get("instruction"):
+    instruction = str(step.get("instruction") or "").strip()
+    if instruction:
         return {
             "stepNumber": step.get("stepNumber") or step.get("no") or index,
-            "instruction": str(step["instruction"]).strip(),
+            "phase": step.get("phase", ""),
+            "instruction": instruction,
         }
 
-    action = str(step.get("action") or "thực hiện").strip().lower()
+    # Rich fallback if model omitted the instruction field
+    action = str(step.get("action") or "").strip()
     main = _join_parts(_clean_parts(step.get("main")))
     with_items = _join_parts(_clean_parts(step.get("with")))
-    time_value = str(step.get("time") or "").strip(" ,.")
-    signal = str(step.get("signal") or "").strip(" ,.")
+    time_val = str(step.get("time") or "").strip()
+    signal = str(step.get("signal") or "").strip()
 
-    object_text = main or with_items or "nguyên liệu đã chuẩn bị"
-    with_clause = f" với {with_items}" if with_items and main else ""
-    together_clause = f" cùng {with_items}" if with_items and main else ""
-
-    templates = {
-        "rửa": f"Rửa sạch {object_text}{together_clause}",
-        "cắt": f"Cắt {object_text}{together_clause}",
-        "thái": f"Thái {object_text}{together_clause}",
-        "băm": f"Băm {object_text}{together_clause}",
-        "sơ chế": f"Sơ chế {object_text}{together_clause}",
-        "pha": f"Pha {object_text}{with_clause}",
-        "nêm": f"Nêm {object_text}{with_clause}",
-        "ướp": f"Ướp {object_text}{with_clause}",
-        "trộn": f"Trộn {object_text}{together_clause}",
-        "xào": f"Xào {object_text}{together_clause}",
-        "chiên": f"Chiên {object_text}{together_clause}",
-        "nấu": f"Nấu {object_text}{together_clause}",
-        "kho": f"Kho {object_text}{together_clause}",
-        "hấp": f"Hấp {object_text}{together_clause}",
-        "luộc": f"Luộc {object_text}{together_clause}",
-    }
-    instruction = templates.get(action, f"{action.capitalize()} {object_text}{together_clause}")
-    if time_value:
-        instruction += f" trong {time_value}"
+    parts = []
+    if action:
+        parts.append(action.capitalize())
+    if main:
+        parts.append(main)
+    if with_items:
+        parts.append(f"cùng {with_items}")
+    if time_val:
+        parts.append(f"trong {time_val}")
     if signal:
-        instruction += f" cho đến khi {signal}"
+        parts.append(f"cho đến khi {signal}")
+
+    if parts:
+        fallback_text = " ".join(parts) + "."
+        if len(parts) == 1 and action:
+            fallback_text = f"{action.capitalize()} các nguyên liệu theo hướng dẫn trong video."
+    else:
+        fallback_text = f"Thực hiện bước {index} theo hướng dẫn trong video."
 
     return {
         "stepNumber": step.get("stepNumber") or step.get("no") or index,
         "phase": step.get("phase", ""),
-        "instruction": instruction + ".",
+        "instruction": fallback_text,
     }
 
 
@@ -310,11 +333,13 @@ def call_llm(prompt: str) -> str:
 FEWSHOT_EXAMPLE = """Ví dụ (1 video mẫu → JSON đúng):
 VIDEO: "...băm nhuyễn tỏi, ướp thịt bò với tỏi băm, nước mắm, tiêu trong 15 phút cho thấm rồi bắc chảo phi thơm..."
 → steps: [
-  {"no":1,"phase":"prep","action":"băm","main":["tỏi"],"with":[],"time":"","signal":""},
-  {"no":2,"phase":"prep","action":"ướp","main":["thịt bò"],"with":["tỏi băm","nước mắm","tiêu"],"time":"15 phút","signal":"thấm"},
-  {"no":3,"phase":"cook","action":"xào","main":["tỏi"],"with":[],"time":"","signal":"thơm"}
+  {"no":1,"phase":"prep","action":"băm","main":["tỏi"],"with":[],"time":"","signal":"","instruction":"Băm nhuyễn tỏi."},
+  {"no":2,"phase":"prep","action":"ướp","main":["thịt bò"],"with":["tỏi băm","nước mắm","tiêu"],"time":"15 phút","signal":"thấm","instruction":"Ướp thịt bò với tỏi băm, nước mắm và tiêu trong 15 phút cho thấm."},
+  {"no":3,"phase":"cook","action":"xào","main":["tỏi"],"with":[],"time":"","signal":"thơm","instruction":"Bắc chảo lên, phi tỏi cho đến khi thơm."}
 ]
-Lưu ý: bước 3 KHÔNG lặp lại "thịt bò" dù cùng món, vì video chỉ nói "phi thơm" với tỏi ở thời điểm đó."""
+Lưu ý quan trọng:
+- Bước 3 KHÔNG lặp lại "thịt bò" dù cùng món, vì video chỉ nói "phi thơm" với tỏi ở thời điểm đó.
+- instruction chỉ diễn giải lại nội dung video, KHÔNG thêm chi tiết nào video không nói (ví dụ video không nói "dao bản rộng", "dầu ăn nóng già", "tiêu xay" thì KHÔNG được viết vào)."""
 
 
 def batch_extract_recipes(videos: list, total_context_budget: int = 6400) -> list:
@@ -349,13 +374,15 @@ def batch_extract_recipes(videos: list, total_context_budget: int = 6400) -> lis
 
 Trích xuất công thức từ {num_videos} video dưới đây. Trả về đúng {num_videos} object theo đúng thứ tự VIDEO.
 
-Quy tắc:
-- Chỉ dùng dữ kiện có trong VIDEO. Thiếu định lượng, thời gian hoặc dấu hiệu thì để chuỗi rỗng, không đoán.
-- Mỗi bước trả dữ kiện ngắn: action, main, with, time, signal, phase; không viết instruction.
-- main/with chỉ gồm nguyên liệu VIDEO nói dùng trong CHÍNH thao tác đó; không dồn toàn bộ nguyên liệu của món vào một bước.
-- action là một động từ đơn: rửa/cắt/thái/băm/sơ chế/ướp/trộn/pha/nêm/xào/chiên/nấu/kho/hấp/luộc.
-- phase là "prep" (sơ chế/ướp/pha) hoặc "cook" (xào/nấu/chiên/kho/hấp/luộc) hoặc "finish" (hoàn thiện/trình bày).
-- Tạo 4-8 bước theo đúng trình tự; gộp thao tác nếu VIDEO không đủ dữ kiện. Không trả lời ngoài JSON.
+Quy tắc CHUNG:
+- Chỉ dùng dữ kiện có trong VIDEO. Thiếu định lượng, thời gian hoặc dấu hiệu thì không bịa ra con số.
+- Tạo 5-10 bước theo đúng trình tự hướng dẫn thực tế trong VIDEO. Không trả lời ngoài JSON.
+
+Quy tắc BẮT BUỘC viết "instruction" cho MỖI BƯỚC:
+- MỖI BƯỚC trong "steps" BẮT BUỘC phải có trường "instruction" (câu tiếng Việt chi tiết, rõ ràng). TUYỆT ĐỐI KHÔNG để trống hay chỉ ghi 1-2 từ chung chung.
+- Viết câu hướng dẫn CHI TIẾT, ĐẦY ĐỦ, tự nhiên theo từng bước nấu ăn của video (gồm cách làm cụ thể, thứ tự, lửa lớn/nhỏ, thời gian đun, dấu hiệu nhận biết khi nào hoàn thành).
+- NGUYÊN TẮC: Chỉ viết những gì video thực sự hướng dẫn, KHÔNG bịa thêm nguyên liệu không có trong video.
+- Giữ trọn vẹn sự chi tiết mà người hướng dẫn nói trong video (ví dụ: "Băm nhỏ 2 tép tỏi, phi thơm trên chảo dầu nóng khoảng 1 phút đến khi ngả vàng", "Ướp thịt bò với 1 thìa nước mắm và tiêu trong 15 phút").
 
 {all_videos_text}
 
@@ -365,7 +392,7 @@ Trả về CHÍNH XÁC JSON:
   "recipes": [
     {{
       "title": "Tên món ăn",
-      "description": "Tóm tắt ngắn hấp dẫn",
+      "description": "Tóm tắt ngắn hấp dẫn (2-3 câu giới thiệu món, đặc trưng hương vị, phù hợp dịp nào)",
       "ingredients": [
         {{ "name": "Tên nguyên liệu", "amount": 500, "unit": "g", "category": "thịt/rau/gia vị/khác" }}
       ],
@@ -377,7 +404,8 @@ Trả về CHÍNH XÁC JSON:
           "main": ["thịt bò"],
           "with": ["tỏi băm", "nước mắm"],
           "time": "10 phút",
-          "signal": "thịt thấm gia vị"
+          "signal": "thịt thấm gia vị",
+          "instruction": "(Chỉ viết những gì video nói — ví dụ: Ướp thịt bò với tỏi băm và nước mắm trong 10 phút cho thấm.)"
         }}
       ],
       "tags": ["tag1"]
