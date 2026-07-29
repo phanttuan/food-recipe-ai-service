@@ -10,23 +10,73 @@ from config import GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL
 logger = logging.getLogger("ai-service.llm")
 
 
-def build_recipe_context(transcript: str, description: str, max_chars: int = 3200) -> str:
-    """Keep the most useful cooking instructions within a fixed prompt budget.
+def _clean_text_noise(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
+    text = re.sub(r"(?i)\b(facebook|tiktok|twitter|instagram|fanpage|website|zalo|subscribe|đăng ký|theo dõi|bản quyền|contact|email|thắc mắc|kênh youtube|fan page)\b.*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    YouTube transcripts often start with greetings and ingredient introductions;
-    blindly taking the first characters drops the actual cooking method.  This
-    function is deterministic and makes no extra model call.
+
+COOKING_ACTION_VERBS = re.compile(
+    r"\b(sơ chế|rửa|cắt|thái|băm|ướp|trộn|pha|nêm|cho|đun|nấu|luộc|hấp|chiên|xào|kho|rim|quay|vớt|tắt|bếp|lửa|đảo|phi|chưng|bày|thưởng thức|chuẩn bị|làm sạch|đun nóng|đổ|rút|trút|múc|gắp|chế|rưới|rắc|vắt|thả|thêm|đậy|hầm|nướng|ngâm|dùng|sốt)\b",
+    re.IGNORECASE
+)
+
+
+def _is_invalid_step(step: dict) -> bool:
+    if not isinstance(step, dict):
+        return False
+    text = " ".join([
+        str(step.get("instruction") or ""),
+        str(step.get("action") or ""),
+        " ".join([str(m) for m in step.get("main") or []]),
+        " ".join([str(w) for w in step.get("with") or []]),
+    ]).lower()
+
+    if len(text.strip()) < 4:
+        return True
+
+    # 1. Check URLs & social media promos
+    if re.search(r"https?://|www\.|facebook\.com|tiktok\.com|twitter\.com|instagram\.com|\.vn\b|\.com\b|fanpage|website", text):
+        return True
+
+    # 2. Check foreign non-Latin scripts (Korean, Japanese, Chinese, Thai, Hindi, Arabic)
+    if re.search(r"[\u3040-\u30ff\u4e00-\u9faf\uac00-\ud7af\u0e00-\u0e7f\u0900-\u097f\u0600-\u06ff]", text):
+        return True
+
+    # 3. Check common multi-language title keywords in video description dumps
+    if re.search(r"\b(resep|sayap|ayam|ailes|poulet|sauce|vietnamienne|recipe|receta)\b", text):
+        return True
+
+    # 4. Must contain at least 1 cooking action verb (filters out raw ingredient quantity list dumps)
+    if not COOKING_ACTION_VERBS.search(text):
+        return True
+
+    return False
+
+
+def build_recipe_context(transcript: str, description: str, max_chars: int = 9000) -> str:
+    """Keep the most useful cooking instructions within a prompt budget.
+
+    If transcript is within budget, preserve the ENTIRE transcript sequentially
+    so that zero cooking details, proportions, or steps are dropped.
     """
     transcript = re.sub(r"\s+", " ", transcript or "").strip()
-    description = re.sub(r"\s+", " ", description or "").strip()
+    description = _clean_text_noise(description)
 
-    description_budget = min(550, max_chars // 4) if description else 0
+    description_budget = min(800, max_chars // 4) if description else 0
     transcript_budget = max_chars - description_budget
     parts = []
     if description:
         parts.append(f"MÔ TẢ VIDEO: {description[:description_budget]}")
 
     if not transcript:
+        return "\n".join(parts)
+
+    if len(transcript) <= transcript_budget:
+        parts.append(f"TRANSCRIPT: {transcript}")
         return "\n".join(parts)
 
     chunks = [item.strip() for item in re.split(r"(?<=[.!?…])\s+", transcript) if item.strip()]
@@ -42,7 +92,7 @@ def build_recipe_context(transcript: str, description: str, max_chars: int = 320
     action_words = (
         "rửa", "cắt", "thái", "băm", "ướp", "trộn", "pha", "nêm", "cho", "đun",
         "nấu", "luộc", "hấp", "chiên", "xào", "kho", "rim", "quay", "vớt", "tắt bếp",
-        "lửa", "phút", "sôi", "chín", "vàng", "mềm", "giòn", "nước mắm",
+        "lửa", "phút", "sôi", "chín", "vàng", "mềm", "giòn", "nước mắm", "muỗng", "thìa", "gam",
     )
     ranked = sorted(
         range(len(chunks)),
@@ -53,9 +103,6 @@ def build_recipe_context(transcript: str, description: str, max_chars: int = 320
         reverse=True,
     )
 
-    # Preserve a little opening context, then choose action-heavy portions plus
-    # their preceding neighbor (quantities/objects are often stated just before
-    # the action verb), restoring original order before sending to the model.
     selected = {0}
     used = len(chunks[0])
     for index in ranked:
@@ -128,11 +175,11 @@ def verify_step_grounding(step: dict, source_text: str) -> dict:
                 logger.info(f"Dropped ungrounded {key} items: {dropped}")
             step[key] = kept
 
-    # Check instruction grounding — drop if <40% of content words are in source
+    # Check instruction grounding — drop if <25% of content words are in source
     instruction = step.get("instruction") or ""
     if instruction:
         ratio = _instruction_grounding_ratio(instruction, source_norm)
-        if ratio < 0.4:
+        if ratio < 0.25:
             logger.warning(
                 f"Dropped hallucinated instruction (grounding {ratio:.0%}): "
                 f"{instruction[:80]}..."
@@ -266,6 +313,21 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
         logger.debug(f"google-genai SDK init note: {e}")
 
 
+def _repair_json_fractions(raw: str) -> str:
+    if not raw:
+        return raw
+    def replace_fraction(match):
+        try:
+            num = float(match.group(1))
+            den = float(match.group(2))
+            if den != 0:
+                return f": {round(num / den, 2)}"
+        except Exception:
+            pass
+        return ": 0"
+    return re.sub(r':\s*(\d+)/(\d+)\b', replace_fraction, raw)
+
+
 def call_llm(prompt: str) -> str:
     """
     Main LLM entrypoint:
@@ -282,7 +344,7 @@ def call_llm(prompt: str) -> str:
                     messages=[
                         {
                             "role": "system",
-                            "content": "Bạn là một đầu bếp chuyên nghiệp Việt Nam. Nhiệm vụ duy nhất của bạn là trích xuất công thức nấu ăn từ nội dung được cung cấp. CHỈ sử dụng thông tin có trong nội dung gốc. TUYỆT ĐỐI KHÔNG bịa đặt hay thêm bất kỳ thông tin nào không có trong nội dung. Luôn trả về JSON hợp lệ."
+                            "content": "Bạn là một đầu bếp chuyên nghiệp Việt Nam. Nhiệm vụ của bạn là trích xuất công thức nấu ăn CỰC KỲ CHI TIẾT, TỪNG BƯỚC CHẶT CHẼ từ nội dung video. CÚ PHÁP JSON BẮT BUỘC: Thuộc tính số lượng 'amount' CHỈ ĐƯỢC dùng số nguyên hoặc số thập phân (như 0.5, 0.33, 1.5, 2). TUYỆT ĐỐI KHÔNG viết dạng phân số 1/2 hay 1/3 vì sẽ gây lỗi cú pháp JSON."
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -330,19 +392,53 @@ def call_llm(prompt: str) -> str:
 # Batch extraction
 # ---------------------------------------------------------------------------
 
-FEWSHOT_EXAMPLE = """Ví dụ (1 video mẫu → JSON đúng):
-VIDEO: "...băm nhuyễn tỏi, ướp thịt bò với tỏi băm, nước mắm, tiêu trong 15 phút cho thấm rồi bắc chảo phi thơm..."
+FEWSHOT_EXAMPLE = """Ví dụ (1 video mẫu → JSON đúng & chi tiết 100% người dùng không cần xem lại video):
+VIDEO: "...thịt bò mua về rửa sạch với nước muối pha loãng, thái lát mỏng vừa ăn. Băm nhuyễn 3 tép tỏi và 1 củ hành tím. Cho thịt bò vào tô ướp với 1 thìa tỏi băm, 1 thìa hành băm, 2 thìa nước mắm, 1 thìa đường và 1 thìa tiêu trong 15 phút cho thấm. Bắc chảo lên bếp, cho 2 thìa dầu ăn đun nóng ở lửa vừa rồi phi thơm phần hành tỏi băm còn lại trong 1 phút đến khi ngả màu vàng nhạt. Tiếp theo trút thịt bò đã ướp vào xào đảo nhanh tay ở lửa lớn trong 3 phút đến khi thịt vừa chín tới và săn lại thì tắt bếp..."
 → steps: [
-  {"no":1,"phase":"prep","action":"băm","main":["tỏi"],"with":[],"time":"","signal":"","instruction":"Băm nhuyễn tỏi."},
-  {"no":2,"phase":"prep","action":"ướp","main":["thịt bò"],"with":["tỏi băm","nước mắm","tiêu"],"time":"15 phút","signal":"thấm","instruction":"Ướp thịt bò với tỏi băm, nước mắm và tiêu trong 15 phút cho thấm."},
-  {"no":3,"phase":"cook","action":"xào","main":["tỏi"],"with":[],"time":"","signal":"thơm","instruction":"Bắc chảo lên, phi tỏi cho đến khi thơm."}
-]
-Lưu ý quan trọng:
-- Bước 3 KHÔNG lặp lại "thịt bò" dù cùng món, vì video chỉ nói "phi thơm" với tỏi ở thời điểm đó.
-- instruction chỉ diễn giải lại nội dung video, KHÔNG thêm chi tiết nào video không nói (ví dụ video không nói "dao bản rộng", "dầu ăn nóng già", "tiêu xay" thì KHÔNG được viết vào)."""
+  {
+    "no": 1,
+    "phase": "prep",
+    "action": "sơ chế & cắt thái",
+    "main": ["thịt bò", "tỏi", "hành tím"],
+    "with": ["nước muối"],
+    "time": "",
+    "signal": "",
+    "instruction": "Sơ chế nguyên liệu: Thịt bò rửa sạch với nước muối pha loãng để khử mùi hôi, dùng khăn sạch thấm khô rồi thái lát mỏng vừa ăn. Tỏi và hành tím bóc vỏ, băm nhuyễn."
+  },
+  {
+    "no": 2,
+    "phase": "prep",
+    "action": "ướp gia vị",
+    "main": ["thịt bò"],
+    "with": ["tỏi băm", "hành băm", "nước mắm", "đường", "tiêu"],
+    "time": "15 phút",
+    "signal": "thấm gia vị",
+    "instruction": "Ướp thịt bò: Cho thịt bò vào tô lớn, nêm 1 thìa tỏi băm, 1 thìa hành băm, 2 thìa nước mắm, 1 thìa đường và 1 thìa tiêu xay. Trộn đều tay rồi để ướp trong 15 phút cho thịt ngấm sâu gia vị."
+  },
+  {
+    "no": 3,
+    "phase": "cook",
+    "action": "phi thơm gia vị",
+    "main": ["tỏi", "hành tím"],
+    "with": ["dầu ăn"],
+    "time": "1 phút",
+    "signal": "ngả vàng thơm",
+    "instruction": "Phi thơm hành tỏi: Đặt chảo lên bếp, cho 2 thìa dầu ăn vào đun nóng ở lửa vừa. Cho phần hành băm và tỏi băm còn lại vào đảo đều trong khoảng 1 phút đến khi dậy mùi thơm và ngả sang màu vàng nhạt."
+  },
+  {
+    "no": 4,
+    "phase": "cook",
+    "action": "xào thịt bò",
+    "main": ["thịt bò"],
+    "with": [],
+    "time": "3 phút",
+    "signal": "thịt săn lại vừa chín tới",
+    "instruction": "Xào thịt bò: Trút toàn bộ thịt bò đã ướp vào chảo, vặn lửa lớn và đảo thật nhanh tay trong 3 phút đến khi thịt chuyển màu, săn lại và vừa chín tới thì tắt bếp ngay để thịt giữ độ mềm ngọt, không bị nhảy hay ráo nước."
+  }
+]"""
 
 
-def batch_extract_recipes(videos: list, total_context_budget: int = 6400) -> list:
+def batch_extract_recipes(videos: list, total_context_budget: int = 24000) -> list:
     """
     Extract recipes from multiple videos in a SINGLE LLM call.
     Each video has: title, description, transcript.
@@ -351,7 +447,7 @@ def batch_extract_recipes(videos: list, total_context_budget: int = 6400) -> lis
     if not videos:
         return []
 
-    per_video_budget = min(3200, max(1200, total_context_budget // len(videos)))
+    per_video_budget = min(9000, max(2400, total_context_budget // len(videos)))
     video_blocks = []
     video_sources = []  # keep raw content per video for post-hoc grounding check
     for i, v in enumerate(videos):
@@ -372,17 +468,26 @@ def batch_extract_recipes(videos: list, total_context_budget: int = 6400) -> lis
 
     prompt = f"""{FEWSHOT_EXAMPLE}
 
-Trích xuất công thức từ {num_videos} video dưới đây. Trả về đúng {num_videos} object theo đúng thứ tự VIDEO.
+Trích xuất công thức chi tiết từ {num_videos} video dưới đây. Trả về đúng {num_videos} object theo đúng thứ tự VIDEO.
 
-Quy tắc CHUNG:
-- Chỉ dùng dữ kiện có trong VIDEO. Thiếu định lượng, thời gian hoặc dấu hiệu thì không bịa ra con số.
-- Tạo 5-10 bước theo đúng trình tự hướng dẫn thực tế trong VIDEO. Không trả lời ngoài JSON.
+ĐẶC BIỆT LƯU Ý - ĐÂY LÀ ĐIỂM NỔI BẬT CỦA ỨNG DỤNG:
+Người dùng đọc công thức này KHÔNG CẦN COI LẠI VIDEO YOUTUBE vẫn tự nấu thành công 100%. 
+Vì vậy, tất cả các bước chế biến phải cực kỳ CHI TIẾT, RÕ RÀNG, CHẶT CHẼ và ĐẦY ĐỦ theo đúng trình tự hướng dẫn thực tế của người nấu trong VIDEO.
 
-Quy tắc BẮT BUỘC viết "instruction" cho MỖI BƯỚC:
-- MỖI BƯỚC trong "steps" BẮT BUỘC phải có trường "instruction" (câu tiếng Việt chi tiết, rõ ràng). TUYỆT ĐỐI KHÔNG để trống hay chỉ ghi 1-2 từ chung chung.
-- Viết câu hướng dẫn CHI TIẾT, ĐẦY ĐỦ, tự nhiên theo từng bước nấu ăn của video (gồm cách làm cụ thể, thứ tự, lửa lớn/nhỏ, thời gian đun, dấu hiệu nhận biết khi nào hoàn thành).
-- NGUYÊN TẮC: Chỉ viết những gì video thực sự hướng dẫn, KHÔNG bịa thêm nguyên liệu không có trong video.
-- Giữ trọn vẹn sự chi tiết mà người hướng dẫn nói trong video (ví dụ: "Băm nhỏ 2 tép tỏi, phi thơm trên chảo dầu nóng khoảng 1 phút đến khi ngả vàng", "Ướp thịt bò với 1 thìa nước mắm và tiêu trong 15 phút").
+Quy tắc BẮT BUỘC cho mỗi bước ("instruction"):
+1. Trình tự logic từ A-Z (5-12 bước): Bắt đầu từ sơ chế làm sạch nguyên liệu -> ướp gia vị (nêu rõ tỷ lệ/muỗng nếu video nhắc tới) -> chế biến từng công đoạn (lửa lớn/nhỏ, thứ tự thả nguyên liệu/gia vị, thời gian đun xào kho) -> hoàn thành và trình bày.
+2. Chi tiết từng hành động: Mỗi bước "instruction" phải viết thành 2-4 câu tiếng Việt tự nhiên, đầy đủ (làm gì, bằng dụng cụ gì, ngọn lửa ra sao, thêm gia vị gì, thời gian bao nhiêu phút, dấu hiệu thị giác/khứu giác khi nào hoàn thành).
+3. Mẹo & Bí quyết: Đưa toàn bộ mẹo nhỏ của người nấu trong video vào đúng bước tương ứng (ví dụ: mẹo khử mùi, cách giữ màu xanh của rau, bí quyết nước sốt sánh mịn).
+4. Chuẩn mực dữ kiện: Tuyệt đối CHỈ trích xuất thông tin có trong VIDEO (không tự bịa thiết bị hay nguyên liệu không có). Nhưng phải khai thác TỐI ĐA và TRỌN VẸN toàn bộ lời thoại và mô tả trong video.
+
+Quy tắc ĐƠN VỊ ĐO LƯỜNG TIẾNG VIỆT cho "unit":
+- BẮT BUỘC dùng đơn vị thuần Việt tự nhiên (muỗng canh, muỗng cà phê, g, kg, ml, tép, củ, quả, trái, chén, lát, miếng, nhúm). TUYỆT ĐỐI KHÔNG dùng từ viết tắt tiếng Anh như Tsp, Tbsp, cup, tablespoon, teaspoon.
+
+Quy tắc BẮT BUỘC về Tiêu đề ("title") và Mô tả ("description"):
+- "title": BẮT BUỘC phải là TÊN CỦA 1 MÓN ĂN ĐƠN LẺ CỤ THỂ (Ví dụ: "Trứng Nướng Hàn Quốc", "Trứng Hấp Vân Ngũ Sắc", "Thịt Bò Xào Cần Tây"). 
+  TUYỆT ĐỐI KHÔNG dùng tên tổng hợp danh sách nhiều món như "8 Món Ngon Từ...", "Top 5 Món...", "Tổng hợp các món...", "Bài viết giới thiệu...".
+  Nếu video gốc dạy nhiều món, CHỈ trích xuất món ăn chính/nổi bật nhất thành 1 công thức món ăn đơn lẻ duy nhất.
+- "description": 2-3 câu ngắn gọn giới thiệu hương vị đặc sắc của món ăn cụ thể đó. KHÔNG dùng câu văn kiểu "Bài viết giới thiệu..." hay "Video tổng hợp các món...".
 
 {all_videos_text}
 
@@ -391,8 +496,8 @@ Trả về CHÍNH XÁC JSON:
 {{
   "recipes": [
     {{
-      "title": "Tên món ăn",
-      "description": "Tóm tắt ngắn hấp dẫn (2-3 câu giới thiệu món, đặc trưng hương vị, phù hợp dịp nào)",
+      "title": "Tên món ăn sạch đẹp",
+      "description": "Tóm tắt hấp dẫn 2-3 câu giới thiệu hương vị đặc sắc của món ăn và điểm đặc biệt khi chế biến theo video",
       "ingredients": [
         {{ "name": "Tên nguyên liệu", "amount": 500, "unit": "g", "category": "thịt/rau/gia vị/khác" }}
       ],
@@ -400,15 +505,15 @@ Trả về CHÍNH XÁC JSON:
         {{
           "no": 1,
           "phase": "prep",
-          "action": "ướp",
-          "main": ["thịt bò"],
-          "with": ["tỏi băm", "nước mắm"],
-          "time": "10 phút",
-          "signal": "thịt thấm gia vị",
-          "instruction": "(Chỉ viết những gì video nói — ví dụ: Ướp thịt bò với tỏi băm và nước mắm trong 10 phút cho thấm.)"
+          "action": "hành động chính (ví dụ: sơ chế & cắt thái)",
+          "main": ["nguyên liệu chính"],
+          "with": ["nguyên liệu phụ/gia vị"],
+          "time": "thời gian nếu có (ví dụ: 15 phút)",
+          "signal": "dấu hiệu nhận biết hoàn thành (ví dụ: thấm gia vị / thơm ngả vàng / chín mềm)",
+          "instruction": "Câu hướng dẫn cực kỳ CHI TIẾT và RÕ RÀNG cho bước này, mô tả trọn vẹn thao tác, ngọn lửa, thời gian và bí quyết trong video."
         }}
       ],
-      "tags": ["tag1"]
+      "tags": ["tag1", "tag2"]
     }}
   ]
 }}
@@ -417,6 +522,7 @@ Trả về CHÍNH XÁC JSON:
 
     try:
         raw = call_llm(prompt)
+        raw = _repair_json_fractions(raw)
         data = json.loads(raw)
         recipes = data.get("recipes", [])
         if not isinstance(recipes, list):
@@ -430,6 +536,7 @@ Trả về CHÍNH XÁC JSON:
             source_text = video_sources[i] if i < len(video_sources) else ""
             raw_steps = recipe.get("steps")
             if isinstance(raw_steps, list):
+                raw_steps = [s for s in raw_steps if not _is_invalid_step(s)]
                 recipe["steps"] = [verify_step_grounding(s, source_text) for s in raw_steps]
                 if not has_cook_phase(recipe["steps"]):
                     logger.warning(f"Recipe '{recipe.get('title', '')}' has no cook-phase step — check source video")
