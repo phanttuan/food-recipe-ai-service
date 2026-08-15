@@ -335,7 +335,7 @@ def call_llm(prompt: str) -> str:
     2. Fallback to Gemini API if Groq fails or key is missing.
     """
     if groq_client:
-        groq_models = [GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
+        groq_models = [GROQ_MODEL, "llama-3.1-8b-instant", "llama-3.3-70b-specdec", "qwen-2.5-32b"]
         groq_models = list(dict.fromkeys(groq_models))
 
         for model in groq_models:
